@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.3
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Go 1.25 compatibility
+            go-version: '1.25'
+            run-race: false
+            upload-coverage: false
+          - name: Go 1.26 primary
+            go-version: '1.26'
+            run-race: true
+            upload-coverage: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.run-race }}" = "true" ]; then
+            make test-race-cover
+          else
+            make test-ci
+          fi
+
+      - name: Coverage summary
+        if: matrix.upload-coverage
+        run: go tool cover -func=coverage.out | tail -n 1
+
+      - name: Upload coverage
+        if: matrix.upload-coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: make build
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ori-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ori
+          if-no-files-found: error
+          retention-days: 7

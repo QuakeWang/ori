@@ -39,7 +39,11 @@ func Build(cfg *config.Settings, workspace string) (*agent.Agent, error) {
 		return nil, fmt.Errorf("app: create store: %w", err)
 	}
 
-	reducer := &store.DefaultReducer{}
+	reducer := &store.DefaultReducer{
+		WindowSize:            cfg.ContextWindowSize,
+		MaxToolResultLen:      cfg.ContextMaxToolResult,
+		MaxToolResultInWindow: cfg.ContextMaxToolResultInWindow,
+	}
 
 	// Command-mode turns can still run without an LLM.
 	// client; non-command turns will surface llmInitErr at runtime.

@@ -81,6 +81,9 @@ Important settings:
 - `ORI_MAX_STEPS` — max agent loop iterations (default 50)
 - `ORI_MAX_TOKENS` — max output tokens per LLM call (default 16384)
 - `ORI_HOME` — state directory (default `~/.ori`)
+- `ORI_CONTEXT_WINDOW_SIZE` — number of recent visible entries that keep full tool_result content; older results are truncated (default 30, 0 = disabled)
+- `ORI_CONTEXT_MAX_TOOL_RESULT` — max characters for truncated tool_result content outside the window (default 300)
+- `ORI_CONTEXT_MAX_TOOL_RESULT_IN_WINDOW` — max characters for tool_result inside the window; prevents oversized results from inflating context (default 8000, -1 = disabled)
 
 Provider routing rules:
 

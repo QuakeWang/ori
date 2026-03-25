@@ -31,6 +31,7 @@ func NewOpenAIClient(apiKey, apiBase string, headers map[string]string, apiForma
 		option.WithAPIKey(apiKey),
 	}
 	if apiBase != "" {
+		apiBase = normalizeBaseURL(apiBase)
 		opts = append(opts, option.WithBaseURL(apiBase))
 	}
 	for k, v := range headers {
@@ -41,6 +42,26 @@ func NewOpenAIClient(apiKey, apiBase string, headers map[string]string, apiForma
 		client:    openai.NewClient(opts...),
 		apiFormat: apiFormat,
 	}
+}
+
+// normalizeBaseURL ensures the base URL ends with a versioned path (e.g. /v1).
+// Many OpenAI-compatible proxies expose their API under /v1/, but users often
+// configure just the host (e.g. "https://api.funai.vip"). The openai-go SDK
+// appends paths like /chat/completions directly to the base URL, so without
+// /v1 the requests hit the wrong endpoint (often the proxy's web UI).
+func normalizeBaseURL(base string) string {
+	trimmed := strings.TrimRight(base, "/")
+	// Already has a versioned suffix like /v1, /v2, etc.
+	lastSlash := strings.LastIndex(trimmed, "/")
+	if lastSlash >= 0 {
+		suffix := trimmed[lastSlash:]
+		if len(suffix) >= 3 && suffix[1] == 'v' && suffix[2] >= '0' && suffix[2] <= '9' {
+			return trimmed
+		}
+	}
+	slog.Warn("llm.base_url.normalized", "original", base, "resolved", trimmed+"/v1",
+		"hint", "appended /v1; set ORI_API_BASE to include /v1 explicitly to suppress this warning")
+	return trimmed + "/v1"
 }
 
 func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error) {
@@ -162,7 +183,8 @@ func toSDKMessage(m Message) openai.ChatCompletionMessageParamUnion {
 		return openai.AssistantMessage(m.Content)
 
 	case "tool":
-		return openai.ToolMessage(m.ToolCallID, m.Content)
+		// SDK signature: ToolMessage(content, toolCallID)
+		return openai.ToolMessage(m.Content, m.ToolCallID)
 
 	default:
 		return openai.UserMessage(m.Content)

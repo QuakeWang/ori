@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -349,7 +350,392 @@ func TestDefaultReducer_ToolCallPreservesAssistantContent(t *testing.T) {
 	assert.Equal(t, "c1", msgs[0].ToolCalls[0].ID)
 }
 
-// ------------------------------------------------------------------ JSONL store redaction on write
+// ------------------------------------------------------------------ context compression (windowed truncation)
+
+func TestDefaultReducer_WindowTruncatesOldToolResult(t *testing.T) {
+	longContent := strings.Repeat("x", 500) // 500 chars, exceeds default 300
+
+	entries := []Entry{
+		// Old entries (outside window):
+		NewUserEntry(llm.Message{Role: "user", Content: "q1"}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.sql", Content: longContent},
+		}),
+		NewAssistantEntry(llm.Message{Role: "assistant", Content: "analysis"}, "stop", llm.Usage{}),
+		// Recent entries (inside window):
+		NewUserEntry(llm.Message{Role: "user", Content: "q2"}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c2", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c2", Name: "doris.sql", Content: longContent},
+		}),
+	}
+
+	r := &DefaultReducer{WindowSize: 3} // last 3 entries are in window
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	// Find tool result messages.
+	var toolResults []llm.Message
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			toolResults = append(toolResults, m)
+		}
+	}
+	require.Len(t, toolResults, 2)
+
+	// First tool_result (outside window) should be truncated.
+	assert.Less(t, len(toolResults[0].Content), len(longContent))
+	assert.Contains(t, toolResults[0].Content, "truncated")
+	assert.Contains(t, toolResults[0].Content, "500 chars total")
+
+	// Second tool_result (inside window) should be full.
+	assert.Equal(t, longContent, toolResults[1].Content)
+}
+
+func TestDefaultReducer_WindowZeroDisablesCompression(t *testing.T) {
+	longContent := strings.Repeat("y", 500)
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "bash", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "bash", Content: longContent},
+		}),
+	}
+
+	r := &DefaultReducer{WindowSize: 0} // disabled
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	// Tool result should be full (no truncation).
+	toolMsg := msgs[len(msgs)-1]
+	assert.Equal(t, longContent, toolMsg.Content)
+}
+
+func TestDefaultReducer_AnchorPlusWindow(t *testing.T) {
+	longContent := strings.Repeat("z", 500)
+
+	entries := []Entry{
+		// Before anchor — should be discarded entirely.
+		NewUserEntry(llm.Message{Role: "user", Content: "old"}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c0", Name: "bash", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c0", Name: "bash", Content: longContent},
+		}),
+		// Anchor.
+		NewAnchorEntry("ckpt", nil),
+		// After anchor, outside window:
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.sql", Content: longContent},
+		}),
+		// After anchor, inside window:
+		NewUserEntry(llm.Message{Role: "user", Content: "recent"}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c2", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c2", Name: "doris.sql", Content: longContent},
+		}),
+	}
+
+	r := &DefaultReducer{WindowSize: 3} // last 3 post-anchor entries in window
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	// Pre-anchor entries should not appear at all.
+	for _, m := range msgs {
+		assert.NotEqual(t, "old", m.Content)
+		assert.NotEqual(t, "c0", m.ToolCallID)
+	}
+
+	// Find tool results.
+	var toolResults []llm.Message
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			toolResults = append(toolResults, m)
+		}
+	}
+	require.Len(t, toolResults, 2)
+
+	// First (c1, outside window after anchor) should be truncated.
+	assert.Contains(t, toolResults[0].Content, "truncated")
+
+	// Second (c2, inside window) should be full.
+	assert.Equal(t, longContent, toolResults[1].Content)
+}
+
+func TestDefaultReducer_ShortToolResultNotTruncated(t *testing.T) {
+	shortContent := "ok" // well below any limit
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.ping", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.ping", Content: shortContent},
+		}),
+		// Padding to push tool_result outside window.
+		NewUserEntry(llm.Message{Role: "user", Content: "pad1"}),
+		NewUserEntry(llm.Message{Role: "user", Content: "pad2"}),
+		NewUserEntry(llm.Message{Role: "user", Content: "pad3"}),
+	}
+
+	r := &DefaultReducer{WindowSize: 2, MaxToolResultLen: 50}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	// The short tool result, even outside window, should NOT be truncated.
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, shortContent, m.Content)
+			assert.NotContains(t, m.Content, "truncated")
+		}
+	}
+}
+
+func TestDefaultReducer_TruncationFormat(t *testing.T) {
+	content := strings.Repeat("A", 100)
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "bash", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "bash", Content: content},
+		}),
+		// Push outside window.
+		NewUserEntry(llm.Message{Role: "user", Content: "pad"}),
+	}
+
+	r := &DefaultReducer{WindowSize: 1, MaxToolResultLen: 20}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	var toolMsg llm.Message
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			toolMsg = m
+		}
+	}
+
+	// Should start with first 20 chars of original content.
+	assert.True(t, strings.HasPrefix(toolMsg.Content, strings.Repeat("A", 20)))
+	// Should end with truncation notice.
+	assert.Contains(t, toolMsg.Content, "...(truncated, 100 chars total)")
+}
+
+func TestDefaultReducer_WindowIgnoresEventState(t *testing.T) {
+	// Verify that event/state entries do NOT consume window quota.
+	// Without this fix, the event and state entries would push the
+	// tool_result outside the window even though they are invisible.
+	longContent := strings.Repeat("v", 500)
+
+	entries := []Entry{
+		// Visible: tool_call + tool_result (these should be inside window).
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.sql", Content: longContent},
+		}),
+		// Invisible entries that follow every tool step in real usage.
+		NewEventEntry(map[string]any{"name": "run", "data": map[string]any{"usage": 100}}),
+		NewEventEntry(map[string]any{"name": "tool_exec"}),
+		// Visible: user message.
+		NewUserEntry(llm.Message{Role: "user", Content: "next question"}),
+	}
+
+	// WindowSize=3 should cover all 3 visible entries (tool_call, tool_result, user).
+	// The 2 event entries must NOT shrink the effective window.
+	r := &DefaultReducer{WindowSize: 3}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	// tool_result should be full (inside window), not truncated.
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, longContent, m.Content,
+				"tool_result should NOT be truncated when only event entries push it outside raw count")
+		}
+	}
+
+	// Events should not appear in output at all.
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "tool_exec")
+	}
+}
+
+func TestDefaultReducer_TruncationUTF8Safe(t *testing.T) {
+	// 10 Chinese characters = 10 runes, 30 bytes.
+	content := "你好世界测试数据输出完"
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "bash", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "bash", Content: content},
+		}),
+		// Push outside window.
+		NewUserEntry(llm.Message{Role: "user", Content: "pad"}),
+	}
+
+	// maxLen=5 runes → should keep first 5 Chinese chars intact.
+	r := &DefaultReducer{WindowSize: 1, MaxToolResultLen: 5}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	var toolMsg llm.Message
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			toolMsg = m
+		}
+	}
+
+	// Must start with exactly first 5 Chinese chars, not broken bytes.
+	assert.True(t, strings.HasPrefix(toolMsg.Content, "你好世界测"))
+	// Must report rune count (11), not byte count (33).
+	assert.Contains(t, toolMsg.Content, "11 chars total")
+	// Must not contain replacement characters (broken UTF-8).
+	assert.NotContains(t, toolMsg.Content, "\uFFFD")
+}
+
+// ------------------------------------------------------------------ in-window truncation
+
+func TestDefaultReducer_InWindowTruncatesLargeToolResult(t *testing.T) {
+	// A tool_result inside the window that exceeds MaxToolResultInWindow
+	// should be truncated to the in-window limit.
+	hugeContent := strings.Repeat("P", 20000) // 20K chars, exceeds 8000 default
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.profile", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.profile", Content: hugeContent},
+		}),
+		NewUserEntry(llm.Message{Role: "user", Content: "analyze this"}),
+	}
+
+	// WindowSize=10 covers all 3 visible entries → all inside window.
+	// MaxToolResultInWindow=500 should still cap the huge result.
+	r := &DefaultReducer{WindowSize: 10, MaxToolResultInWindow: 500}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Less(t, len(m.Content), len(hugeContent))
+			assert.Contains(t, m.Content, "truncated")
+			assert.Contains(t, m.Content, "20000 chars total")
+		}
+	}
+}
+
+func TestDefaultReducer_InWindowSmallToolResultPreserved(t *testing.T) {
+	// A tool_result inside the window that is below MaxToolResultInWindow
+	// should be preserved in full.
+	shortContent := "query completed in 150ms"
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.sql", Content: shortContent},
+		}),
+		NewUserEntry(llm.Message{Role: "user", Content: "next"}),
+	}
+
+	r := &DefaultReducer{WindowSize: 10, MaxToolResultInWindow: 8000}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, shortContent, m.Content)
+		}
+	}
+}
+
+func TestDefaultReducer_InWindowDisabledWithNegativeOne(t *testing.T) {
+	// MaxToolResultInWindow = -1 disables in-window truncation entirely.
+	hugeContent := strings.Repeat("X", 50000)
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.profile", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.profile", Content: hugeContent},
+		}),
+		NewUserEntry(llm.Message{Role: "user", Content: "pad"}),
+	}
+
+	r := &DefaultReducer{WindowSize: 10, MaxToolResultInWindow: -1}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, hugeContent, m.Content, "in-window truncation disabled, content should be full")
+		}
+	}
+}
+
+func TestDefaultReducer_AllEntriesInWindowStillTruncates(t *testing.T) {
+	// This is the exact scenario that caused the original 1.7 MB context bug.
+	// With only ~10 visible entries and WindowSize=30, ALL entries are inside
+	// the window. Without MaxToolResultInWindow the 256 KB profile data would
+	// pass through untruncated.
+	profileData := strings.Repeat("Q", 100000) // simulate 100K profile
+
+	entries := []Entry{
+		NewUserEntry(llm.Message{Role: "user", Content: "analyze de0afeeab9734662-88bc0e8de4e4428c"}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.sql", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.sql", Content: "query_id found"},
+		}),
+		NewAssistantEntry(llm.Message{Role: "assistant", Content: "let me get profile"}, "stop", llm.Usage{}),
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c2", Name: "doris.profile", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c2", Name: "doris.profile", Content: profileData},
+		}),
+	}
+
+	// WindowSize=30|visibleCount=6 → all inside window.
+	// Default MaxToolResultInWindow=8000 should cap the profile result.
+	r := &DefaultReducer{WindowSize: 30}
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	for _, m := range msgs {
+		if m.ToolCallID == "c2" {
+			assert.Less(t, len(m.Content), 9000,
+				"in-window cap (default 8000) should truncate 100K profile")
+			assert.Contains(t, m.Content, "truncated")
+		}
+		// Short tool result should be unaffected.
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, "query_id found", m.Content)
+		}
+	}
+}
 
 func TestJSONLStore_RedactsOnWrite(t *testing.T) {
 	dir := t.TempDir()

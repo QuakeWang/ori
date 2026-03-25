@@ -27,25 +27,31 @@ var validAPIFormats = map[APIFormat]bool{
 }
 
 const (
-	DefaultModel     = "openrouter:qwen/qwen3-coder-next"
-	DefaultAPIFormat = APIFormatCompletion
-	DefaultMaxSteps  = 50
-	DefaultMaxToken  = 16384
+	DefaultModel                        = "openrouter:qwen/qwen3-coder-next"
+	DefaultAPIFormat                    = APIFormatCompletion
+	DefaultMaxSteps                     = 50
+	DefaultMaxToken                     = 16384
+	DefaultContextWindowSize            = 30
+	DefaultContextMaxToolResult         = 300
+	DefaultContextMaxToolResultInWindow = 8000
 )
 
 // Settings holds runtime configuration loaded from environment variables
 // and .env files. All keys use the ORI_ prefix.
 type Settings struct {
-	Home           string
-	Model          string
-	FallbackModels []string
-	APIKey         map[string]string // provider -> key
-	APIBase        map[string]string // provider -> base URL
-	APIFormat      APIFormat         // APIFormatCompletion | APIFormatResponses
-	MaxSteps       int
-	MaxTokens      int
-	ModelTimeout   time.Duration
-	Verbose        int
+	Home                          string
+	Model                         string
+	FallbackModels                []string
+	APIKey                        map[string]string // provider -> key
+	APIBase                       map[string]string // provider -> base URL
+	APIFormat                     APIFormat         // APIFormatCompletion | APIFormatResponses
+	MaxSteps                      int
+	MaxTokens                     int
+	ModelTimeout                  time.Duration
+	Verbose                       int
+	ContextWindowSize             int // context compression: entries inside window keep full tool_result
+	ContextMaxToolResult          int // context compression: max chars for truncated tool_result
+	ContextMaxToolResultInWindow  int // context compression: max chars for in-window tool_result (-1=disabled)
 }
 
 // Load reads configuration from the workspace .env (if present) merged with the
@@ -89,13 +95,37 @@ func Load(workspace string) (*Settings, error) {
 		return nil, fmt.Errorf("invalid ORI_VERBOSE %d: must be in range [0, 2]", verbose)
 	}
 
+	contextWindowSize, err := envutil.IntOr(env, "ORI_CONTEXT_WINDOW_SIZE", DefaultContextWindowSize)
+	if err != nil {
+		return nil, err
+	}
+	if contextWindowSize < 0 {
+		return nil, fmt.Errorf("invalid ORI_CONTEXT_WINDOW_SIZE %d: must be >= 0", contextWindowSize)
+	}
+
+	contextMaxToolResult, err := envutil.IntOr(env, "ORI_CONTEXT_MAX_TOOL_RESULT", DefaultContextMaxToolResult)
+	if err != nil {
+		return nil, err
+	}
+	if contextMaxToolResult < 0 {
+		return nil, fmt.Errorf("invalid ORI_CONTEXT_MAX_TOOL_RESULT %d: must be >= 0", contextMaxToolResult)
+	}
+
+	contextMaxToolResultInWindow, err := envutil.IntOr(env, "ORI_CONTEXT_MAX_TOOL_RESULT_IN_WINDOW", DefaultContextMaxToolResultInWindow)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Settings{
-		Home:      resolveHome(envutil.StringOr(env, "ORI_HOME", defaultHome())),
-		Model:     envutil.StringOr(env, "ORI_MODEL", DefaultModel),
-		APIFormat: apiFormat,
-		MaxSteps:  maxSteps,
-		MaxTokens: maxTokens,
-		Verbose:   verbose,
+		Home:                         resolveHome(envutil.StringOr(env, "ORI_HOME", defaultHome())),
+		Model:                        envutil.StringOr(env, "ORI_MODEL", DefaultModel),
+		APIFormat:                    apiFormat,
+		MaxSteps:                     maxSteps,
+		MaxTokens:                    maxTokens,
+		Verbose:                      verbose,
+		ContextWindowSize:            contextWindowSize,
+		ContextMaxToolResult:         contextMaxToolResult,
+		ContextMaxToolResultInWindow: contextMaxToolResultInWindow,
 	}
 
 	if v := env["ORI_MODEL_TIMEOUT_SECONDS"]; v != "" {

@@ -107,10 +107,10 @@ When the user provides a `query_id` or asks to analyze a specific SQL's runtime 
 
 ### Step P1: Get or collect query profile
 
-**Option A — query_id provided**: Use `doris.profile` to retrieve the detailed profile:
+**Option A — query_id provided**: Use `doris.profile` to retrieve the Doris-native merged view first:
 
 ```
-doris_profile(query_id="<query_id>")
+doris_profile(query_id="<query_id>", view="merged")
 ```
 
 If `doris.profile` returns an error (profile expired or not found), fallback to Option B.
@@ -128,10 +128,10 @@ Then retrieve the profile for the latest execution:
 doris_sql(sql="SHOW QUERY PROFILE '/'")
 ```
 
-Pick the matching `query_id` from the list and retrieve its detail:
+Pick the matching `query_id` from the list and retrieve the merged view first:
 
 ```
-doris_profile(query_id="<new_query_id>")
+doris_profile(query_id="<new_query_id>", view="merged")
 ```
 
 > **IMPORTANT**: When the user says "collect profile", "run the profile", or "execute it yourself", you MUST execute the SQL yourself with `enable_profile=true`. Do NOT deflect back to the user.
@@ -157,6 +157,12 @@ Also note:
 - `Scan Thread Num` / `Max Remote Scan Thread Num`: scan parallelism configuration
 
 ### Step P4: Operator-level deep analysis
+
+When `merged` view identifies the hotspot fragment or operator family, retrieve the detail view for drilldown:
+
+```
+doris_profile(query_id="<query_id>", view="detail")
+```
 
 Profile Detail is organized as `Fragment → Pipeline → Operator`. Each operator has `CommonCounters` and `CustomCounters`.
 

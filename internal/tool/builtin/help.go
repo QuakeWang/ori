@@ -18,7 +18,7 @@ var helpExamples = []helpExample{
 	{name: "skill", command: ",skill name=foo"},
 	{name: "doris.ping", command: ",doris.ping"},
 	{name: "doris.sql", command: ",doris.sql sql='SHOW FRONTENDS'"},
-	{name: "doris.profile", command: ",doris.profile query_id=82d453a2105346fb-90eaedcefaca6992"},
+	{name: "doris.profile", command: ",doris.profile query_id=82d453a2105346fb-90eaedcefaca6992 view=merged"},
 	{name: "tape.info", command: ",tape.info"},
 	{name: "tape.handoff", command: ",tape.handoff name=phase-1 summary='done'"},
 	{name: "tape.anchors", command: ",tape.anchors"},

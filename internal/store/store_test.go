@@ -418,6 +418,32 @@ func TestDefaultReducer_WindowZeroDisablesCompression(t *testing.T) {
 	assert.Equal(t, longContent, toolMsg.Content)
 }
 
+func TestDefaultReducer_WindowZeroSkipsInWindowCap(t *testing.T) {
+	// Regression: WindowSize=0 must also skip MaxToolResultInWindow,
+	// otherwise huge results are silently truncated despite disablement.
+	hugeContent := strings.Repeat("H", 50000) // well above the 8000 default cap
+
+	entries := []Entry{
+		newToolCallHelper(t, []llm.ToolCall{
+			{ID: "c1", Name: "doris.profile", Arguments: json.RawMessage(`{}`)},
+		}),
+		newToolResultHelper(t, []ToolResultItem{
+			{ToolCallID: "c1", Name: "doris.profile", Content: hugeContent},
+		}),
+	}
+
+	r := &DefaultReducer{WindowSize: 0} // disabled — no truncation at all
+	msgs, err := r.Reduce(entries)
+	require.NoError(t, err)
+
+	for _, m := range msgs {
+		if m.ToolCallID == "c1" {
+			assert.Equal(t, hugeContent, m.Content,
+				"WindowSize=0 should disable ALL truncation including in-window cap")
+		}
+	}
+}
+
 func TestDefaultReducer_AnchorPlusWindow(t *testing.T) {
 	longContent := strings.Repeat("z", 500)
 

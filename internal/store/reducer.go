@@ -111,12 +111,17 @@ func (r *DefaultReducer) Reduce(entries []Entry) ([]llm.Message, error) {
 	// In-window cap: even entries inside the window are truncated when they
 	// exceed MaxToolResultInWindow. This is a safety net against single
 	// oversized results (e.g. 256 KB query profiles).
-	inWindowMax := r.MaxToolResultInWindow
-	if inWindowMax == 0 {
-		inWindowMax = defaultMaxToolResultInWindow
-	}
-	if inWindowMax < 0 {
-		inWindowMax = 0 // disabled
+	// When WindowSize <= 0 (windowing disabled), skip the in-window cap
+	// entirely so that "WindowSize=0 disables all truncation" holds true.
+	inWindowMax := 0
+	if r.WindowSize > 0 {
+		inWindowMax = r.MaxToolResultInWindow
+		if inWindowMax == 0 {
+			inWindowMax = defaultMaxToolResultInWindow
+		}
+		if inWindowMax < 0 {
+			inWindowMax = 0 // explicitly disabled
+		}
 	}
 
 	visibleIdx := 0
